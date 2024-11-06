@@ -1,122 +1,197 @@
 package main
 
 import (
-    "flag"
-    "fmt"
-    "log"
-    "os"
+	"flag"
+	"fmt"
+	"log"
+	"os"
+	"strings"
+	"sync"
+	"time"
 
-    "github.com/aws/aws-sdk-go/aws"
-    "github.com/aws/aws-sdk-go/aws/session"
-    "github.com/aws/aws-sdk-go/service/s3"
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go/service/s3"
 )
 
-var sizeTable = []string{"Bs", "KBs", "MBs", "GBs", "TBs", "PBs", "EBs"}
-
-func calculateSize(size int64) string {
-    count := 0
-    floatSize := float64(size)
-    for floatSize >= 1024 && count < len(sizeTable)-1 {
-        floatSize /= 1024
-        count++
-    }
-    return fmt.Sprintf("%.2f %s", floatSize, sizeTable[count])
+type SizeStats struct {
+	CurrentSize    int64
+	VersionedSize  int64
+	CurrentCount   int64
+	VersionedCount int64
+	DeleteMarkers  int64
+	LastModified   time.Time
 }
 
-func getS3Statistics(bucket, prefix string) (map[string]interface{}, error) {
-    sess, err := session.NewSession(&aws.Config{
-        Region: aws.String("us-east-1"), // Altere para a região do seu bucket
-    })
-    if err != nil {
-        return nil, err
-    }
+func formatSize(bytes int64) string {
+	const (
+		B  = 1
+		KB = 1024 * B
+		MB = 1024 * KB
+		GB = 1024 * MB
+		TB = 1024 * GB
+		PB = 1024 * TB
+	)
 
-    s3Client := s3.New(sess)
+	switch {
+	case bytes >= PB:
+		return fmt.Sprintf("%.2f PB", float64(bytes)/float64(PB))
+	case bytes >= TB:
+		return fmt.Sprintf("%.2f TB", float64(bytes)/float64(TB))
+	case bytes >= GB:
+		return fmt.Sprintf("%.2f GB", float64(bytes)/float64(GB))
+	case bytes >= MB:
+		return fmt.Sprintf("%.2f MB", float64(bytes)/float64(MB))
+	case bytes >= KB:
+		return fmt.Sprintf("%.2f KB", float64(bytes)/float64(KB))
+	default:
+		return fmt.Sprintf("%d B", bytes)
+	}
+}
 
-    params := &s3.ListObjectVersionsInput{
-        Bucket: aws.String(bucket),
-    }
+func processBucket(svc *s3.S3, bucket, prefix string, includeVersions bool, detailedOutput bool) (*SizeStats, error) {
+	stats := &SizeStats{}
+	var mutex sync.Mutex
+	var wg sync.WaitGroup
 
-    if prefix != "" {
-        params.Prefix = aws.String(prefix)
-    }
+	if includeVersions {
+		input := &s3.ListObjectVersionsInput{
+			Bucket: aws.String(bucket),
+			Prefix: aws.String(prefix),
+		}
 
-    deleteMarkerCount := int64(0)
-    versionedObjectCount := int64(0)
-    versionedObjectSize := int64(0)
-    currentObjectCount := int64(0)
-    currentObjectSize := int64(0)
+		err := svc.ListObjectVersionsPages(input, func(page *s3.ListObjectVersionsOutput, lastPage bool) bool {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				mutex.Lock()
+				for _, v := range page.Versions {
+					if *v.IsLatest {
+						stats.CurrentSize += *v.Size
+						stats.CurrentCount++
+						if v.LastModified.After(stats.LastModified) {
+							stats.LastModified = *v.LastModified
+						}
+					} else {
+						stats.VersionedSize += *v.Size
+						stats.VersionedCount++
+					}
+				}
+				stats.DeleteMarkers += int64(len(page.DeleteMarkers))
+				mutex.Unlock()
+			}()
+			return true
+		})
+		wg.Wait()
+		if err != nil {
+			return nil, fmt.Errorf("erro ao listar versões: %v", err)
+		}
+	} else {
+		input := &s3.ListObjectsV2Input{
+			Bucket: aws.String(bucket),
+			Prefix: aws.String(prefix),
+		}
 
-    fmt.Println("$ Calculando, por favor aguarde... isso pode levar algum tempo")
+		err := svc.ListObjectsV2Pages(input, func(page *s3.ListObjectsV2Output, lastPage bool) bool {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				mutex.Lock()
+				for _, obj := range page.Contents {
+					stats.CurrentSize += *obj.Size
+					stats.CurrentCount++
+					if obj.LastModified.After(stats.LastModified) {
+						stats.LastModified = *obj.LastModified
+					}
+				}
+				mutex.Unlock()
+			}()
+			return true
+		})
+		wg.Wait()
+		if err != nil {
+			return nil, fmt.Errorf("erro ao listar objetos: %v", err)
+		}
+	}
 
-    err = s3Client.ListObjectVersionsPages(params,
-        func(page *s3.ListObjectVersionsOutput, lastPage bool) bool {
-            if len(page.DeleteMarkers) > 0 {
-                deleteMarkerCount += int64(len(page.DeleteMarkers))
-            }
+	return stats, nil
+}
 
-            if len(page.Versions) > 0 {
-                for _, version := range page.Versions {
-                    if *version.IsLatest {
-                        currentObjectCount++
-                        currentObjectSize += *version.Size
-                    } else {
-                        versionedObjectCount++
-                        versionedObjectSize += *version.Size
-                    }
-                }
-            }
-            return true
-        })
+func printProgressBar(progress float64) {
+	width := 50
+	completed := int(progress * float64(width))
+	remaining := width - completed
 
-    if err != nil {
-        return nil, err
-    }
-
-    totalSize := currentObjectSize + versionedObjectSize
-
-    prefixDisplay := prefix
-    if prefix == "" {
-        prefixDisplay = "(nenhum)"
-    }
-
-    return map[string]interface{}{
-        "bucket":                 bucket,
-        "prefix":                 prefixDisplay,
-        "delete_marker_count":    deleteMarkerCount,
-        "current_object_count":   currentObjectCount,
-        "current_object_size":    calculateSize(currentObjectSize),
-        "versioned_object_count": versionedObjectCount,
-        "versioned_object_size":  calculateSize(versionedObjectSize),
-        "total_size":             calculateSize(totalSize),
-    }, nil
+	fmt.Printf("\r[%s%s] %.1f%%",
+		strings.Repeat("=", completed),
+		strings.Repeat(" ", remaining),
+		progress*100)
 }
 
 func main() {
-    bucket := flag.String("b", "", "Nome do bucket S3")
-    prefix := flag.String("p", "", "Prefixo dos objetos S3 (opcional)")
-    flag.Parse()
+	bucket := flag.String("b", "", "Nome do bucket S3")
+	prefix := flag.String("p", "", "Prefixo dos objetos (pasta)")
+	includeVersions := flag.Bool("v", false, "Incluir versões antigas")
+	detailed := flag.Bool("d", false, "Saída detalhada")
+	region := flag.String("r", "us-east-1", "Região AWS")
+	flag.Parse()
 
-    if *bucket == "" {
-        fmt.Println("Uso: go run script.go -b <nome_do_bucket> [-p <prefixo>]")
-        flag.PrintDefaults()
-        os.Exit(1)
-    }
+	if *bucket == "" {
+		fmt.Println("Uso: ./s3size -b BUCKET_NAME [-p PREFIX] [-v] [-d] [-r REGION]")
+		flag.PrintDefaults()
+		os.Exit(1)
+	}
 
-    stats, err := getS3Statistics(*bucket, *prefix)
-    if err != nil {
-        log.Fatalf("Erro: %v", err)
-    }
+	// Configuração da sessão AWS
+	sess, err := session.NewSession(&aws.Config{
+		Region: aws.String(*region),
+	})
+	if err != nil {
+		log.Fatalf("Erro ao criar sessão AWS: %v", err)
+	}
 
-    fmt.Println("\n----------")
-    fmt.Printf("$ Nome do Bucket: %s\n", stats["bucket"])
-    fmt.Printf("$ Prefixo: %s\n", stats["prefix"])
-    fmt.Printf("$ Total de Delete Markers: %d\n", stats["delete_marker_count"])
-    fmt.Printf("$ Número de Objetos Atuais: %d\n", stats["current_object_count"])
-    fmt.Printf("$ Tamanho dos Objetos Atuais: %s\n", stats["current_object_size"])
-    fmt.Printf("$ Número de Objetos Não Atuais: %d\n", stats["versioned_object_count"])
-    fmt.Printf("$ Tamanho dos Objetos Não Atuais: %s\n", stats["versioned_object_size"])
-    fmt.Printf("$ Tamanho Total (Atual + Não Atuais): %s\n", stats["total_size"])
-    fmt.Println("----------\n")
-    fmt.Println("$ Processo concluído com sucesso")
+	svc := s3.New(sess)
+
+	fmt.Printf("\nIniciando cálculo para bucket '%s'", *bucket)
+	if *prefix != "" {
+		fmt.Printf(" com prefixo '%s'", *prefix)
+	}
+	fmt.Println("\nCalculando...")
+
+	startTime := time.Now()
+	stats, err := processBucket(svc, *bucket, *prefix, *includeVersions, *detailed)
+	if err != nil {
+		log.Fatalf("Erro ao processar bucket: %v", err)
+	}
+	duration := time.Since(startTime)
+
+	// Limpa a linha do progress bar
+	fmt.Print("\r" + strings.Repeat(" ", 80) + "\r")
+
+	fmt.Println("\n=== Relatório de Tamanho do S3 ===")
+	fmt.Printf("Bucket: %s\n", *bucket)
+	if *prefix != "" {
+		fmt.Printf("Prefixo: %s\n", *prefix)
+	}
+	fmt.Printf("Tempo de execução: %v\n", duration.Round(time.Millisecond))
+	fmt.Printf("\nArquivos atuais: %d (Tamanho: %s)\n",
+		stats.CurrentCount,
+		formatSize(stats.CurrentSize))
+
+	if *includeVersions {
+		fmt.Printf("Versões antigas: %d (Tamanho: %s)\n",
+			stats.VersionedCount,
+			formatSize(stats.VersionedSize))
+		fmt.Printf("Marcadores de deleção: %d\n", stats.DeleteMarkers)
+		fmt.Printf("Tamanho total (incluindo versões): %s\n",
+			formatSize(stats.CurrentSize+stats.VersionedSize))
+	}
+
+	if *detailed {
+		fmt.Printf("\nÚltima modificação: %v\n", stats.LastModified)
+		fmt.Printf("Tamanho médio por arquivo: %s\n",
+			formatSize(stats.CurrentSize/stats.CurrentCount))
+	}
+
+	fmt.Println("\nCálculo concluído com sucesso!")
 }
