@@ -54,13 +54,13 @@ $ Tamanho Total (Atual + Não Atuais): 1.7 GBs
  $ Processo concluído com sucesso 
 ```
 
-### Script em Go está sendo completamente Refatorado
+### 🙈 Script em Go está sendo completamente Refatorado
 
 ```bash
 go mod init s3dirsize
 go get -u github.com/aws/aws-sdk-go 
 ```
-** 🙈 Notas Importantes para o Script em Go:**
+** Notas Importantes para o Script em Go:**
 
 -   **Nome do Aplicativo**: O aplicativo é chamado `s3dirsize`.
     
